@@ -10,13 +10,13 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/inconshreveable/log15"
+	"github.com/lucasb-eyer/go-colorful"
 	"github.com/myusuf3/imghash"
 	"github.com/slack-go/slack"
 )
@@ -25,6 +25,7 @@ var dev = flag.String("dev", "/dev/video0", "v4l device")
 var minDistance = flag.Int("distance", 4, "Min image distance")
 var fileDir = flag.String("file-dir", "", "Directory to write images to")
 var bucket = flag.String("bucket", "", "S3 bucket")
+var delayMillis = flag.Int("delay-ms", 1000, "Delay in milliseconds")
 
 func main() {
 	flag.Parse()
@@ -37,6 +38,8 @@ func main() {
 		stderr   bytes.Buffer
 		prevHash uint64
 
+		prevSaveTime time.Time
+
 		webhookURL = os.Getenv("SLACK_WEBHOOK_URL")
 	)
 
@@ -47,14 +50,14 @@ func main() {
 	})
 	s3client := s3.New(sess)
 
-	t := time.NewTicker(1 * time.Second)
+	t := time.NewTicker(time.Duration(*delayMillis) * time.Millisecond)
 	for {
 		<-t.C
 
 		stdout.Reset()
 		stderr.Reset()
 
-		cmd := exec.Command("ffmpeg", "-f", "video4linux2", "-input_format", "mjpeg", "-video_size", "1280x720", "-i", *dev, "-vframes", "1", "-f", "mjpeg", "-")
+		cmd := exec.Command("ffmpeg", "-f", "video4linux2", "-input_format", "mjpeg", "-video_size", "1280x720", "-i", *dev, "-vframes", "1", "-vf", "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf:text='%{localtime}':fontcolor=white@0.8:x=7:y=7", "-f", "mjpeg", "-")
 
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
@@ -73,32 +76,54 @@ func main() {
 			continue
 		}
 
+		var (
+			sumL  float64
+			count int
+		)
+
+		bounds := img.Bounds()
+		for x := 0; x < bounds.Max.X; x++ {
+			for y := 0; y < bounds.Max.Y; y++ {
+				c, _ := colorful.MakeColor(img.At(x, y))
+				_, _, l := c.Hsl()
+				sumL += l
+				count++
+			}
+		}
+
+		avgL := sumL / float64(count)
 		curHash := imghash.Average(img)
 		dist := imghash.Distance(prevHash, curHash)
-		fmt.Printf("prev: %d cur: %d  distance: %d\n", prevHash, curHash, dist)
-		if dist > uint64(*minDistance) {
-			lgr.Info("motion_detected")
+		fmt.Printf("prev: %d cur: %d  distance: %d avgL:%f\n", prevHash, curHash, dist, avgL)
+
+		sinceLastSave := time.Since(prevSaveTime)
+		mustSaveTime := sinceLastSave > time.Hour
+
+		if (avgL > 0.15 && dist > uint64(*minDistance)) || mustSaveTime {
+			if mustSaveTime {
+				lgr.Info("since_last_save_more_than_1_hour", "since", sinceLastSave)
+			} else {
+				lgr.Info("motion_detected")
+			}
 
 			ts := time.Now()
 
-			if *fileDir != "" {
-				filename := filepath.Join(*fileDir, ts.Format("15_04_05")+".jpg")
+			sum := sha256.Sum256(imgb)
+			filename := ts.Format("2006-01-02_15:04:05") + "_" + hex.EncodeToString(sum[:]) + ".jpg"
 
+			if *fileDir != "" {
 				err = ioutil.WriteFile(filename, imgb, 0644)
 				if err != nil {
 					lgr.Error("write_file_err", "err", err)
 				}
 			}
 
-			sum := sha256.Sum256(imgb)
-
-			filename := ts.Format("15_04_05") + "_" + hex.EncodeToString(sum[:]) + ".jpg"
-
 			if *bucket != "" {
 				_, err = s3client.PutObject(&s3.PutObjectInput{
-					Bucket: bucket,
-					Key:    &filename,
-					Body:   bytes.NewReader(imgb),
+					Bucket:      bucket,
+					Key:         &filename,
+					Body:        bytes.NewReader(imgb),
+					ContentType: aws.String("image/jpeg"),
 				})
 				if err != nil {
 					lgr.Error("s3_put_obj_err", "err", err)
@@ -130,6 +155,9 @@ func main() {
 						lgr.Error("slack_webhook_err", "err", err)
 					}
 				}
+
+				prevSaveTime = time.Now()
+
 			}
 
 		} else {
