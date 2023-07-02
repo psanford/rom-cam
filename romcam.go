@@ -21,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/inconshreveable/log15"
 	"github.com/psanford/rom-cam/config"
+	"github.com/psanford/rom-cam/kernelmodule"
 	"github.com/slack-go/slack"
 )
 
@@ -51,7 +52,12 @@ func main() {
 	ffmpegPath = conf.FFMPEGPath
 	dev = conf.Device
 
-	fmt.Printf("config: %+v\n", conf)
+	if conf.LoadKernelModule {
+		err := kernelmodule.LoadUVCVideo()
+		if err != nil {
+			lgr.Error("load_kernel_module_err", "err", err)
+		}
+	}
 
 	var creds *credentials.Credentials
 	if conf.AWSCreds != nil {

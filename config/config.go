@@ -3,12 +3,13 @@ package config
 import "github.com/BurntSushi/toml"
 
 type Config struct {
-	FFMPEGPath string   `toml:"ffmpeg_path"`
-	Device     string   `toml:"device"`
-	SaveTSDir  string   `toml:"save_ts_dir"`
-	Bucket     string   `toml:"bucket"`
-	WebhookURL string   `toml:"webhook_url"`
-	AWSCreds   *AWSCred `toml:"aws_creds"`
+	FFMPEGPath       string   `toml:"ffmpeg_path"`
+	Device           string   `toml:"device"`
+	SaveTSDir        string   `toml:"save_ts_dir"`
+	Bucket           string   `toml:"bucket"`
+	WebhookURL       string   `toml:"webhook_url"`
+	LoadKernelModule bool     `toml:"load_kernel_module"`
+	AWSCreds         *AWSCred `toml:"aws_creds"`
 }
 
 type AWSCred struct {
