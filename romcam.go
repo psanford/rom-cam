@@ -1,31 +1,34 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
 	"flag"
 	"fmt"
-	"image/jpeg"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/inconshreveable/log15"
-	"github.com/lucasb-eyer/go-colorful"
-	"github.com/myusuf3/imghash"
 	"github.com/slack-go/slack"
 )
 
+var ffmpegPath = "/home/psanford/projects/rom-cam/ffmpeg"
+var segmentSize = 10 * time.Second // this matches the gop for the logitec cam
+
 var dev = flag.String("dev", "/dev/video0", "v4l device")
-var minDistance = flag.Int("distance", 4, "Min image distance")
-var fileDir = flag.String("file-dir", "", "Directory to write images to")
+var saveTSDir = flag.String("save-ts", "", "Directory to save segments to")
 var bucket = flag.String("bucket", "", "S3 bucket")
-var delayMillis = flag.Int("delay-ms", 1000, "Delay in milliseconds")
+
+var fixedLoc = time.FixedZone("UTC-7", -7*60*60)
 
 func main() {
 	flag.Parse()
@@ -33,15 +36,9 @@ func main() {
 	log15.Root().SetHandler(handler)
 	lgr := log15.New()
 
-	var (
-		stdout   bytes.Buffer
-		stderr   bytes.Buffer
-		prevHash uint64
+	ctx := context.Background()
 
-		prevSaveTime time.Time
-
-		webhookURL = os.Getenv("SLACK_WEBHOOK_URL")
-	)
+	webhookURL := os.Getenv("SLACK_WEBHOOK_URL")
 
 	// set AWS_ACCESS_KEY_ID
 	//     AWS_SECRET_ACCESS_KEY
@@ -50,104 +47,119 @@ func main() {
 	})
 	s3client := s3.New(sess)
 
-	t := time.NewTicker(time.Duration(*delayMillis) * time.Millisecond)
-	for {
-		<-t.C
+	segmentChan := make(chan Segment, 1)
 
-		stdout.Reset()
-		stderr.Reset()
+	err := captureSource(ctx, lgr, segmentChan)
+	if err != nil {
+		panic(err)
+	}
+	first := true
 
-		cmd := exec.Command("ffmpeg", "-f", "video4linux2", "-input_format", "mjpeg", "-video_size", "1280x720", "-i", *dev, "-vframes", "1", "-vf", "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf:text='%{localtime}':fontcolor=white@0.8:x=7:y=7", "-f", "mjpeg", "-")
-
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-
-		err := cmd.Run()
-		if err != nil {
-			lgr.Error("ffmpeg_err", "err", stderr.String())
+	for segment := range segmentChan {
+		if *saveTSDir != "" {
+			fp := filepath.Join(*saveTSDir, fmt.Sprintf("%d.ts", segment.ts.Unix()))
+			ioutil.WriteFile(fp, segment.data, 0600)
+			lgr.Info("wrote_local_file", "path", fp)
+		}
+		if first {
+			// skip first 10 seconds of recording,
+			// the camera adjusts when it first starts
+			first = false
 			continue
 		}
 
-		imgb := stdout.Bytes()
-
-		img, err := jpeg.Decode(bytes.NewReader(imgb))
+		motionFrames, err := hasMotion(ctx, lgr, segment)
 		if err != nil {
-			lgr.Error("jpeg_decode_err", "err", err)
-			continue
+			panic(err)
 		}
 
-		var (
-			sumL  float64
-			count int
-		)
-
-		bounds := img.Bounds()
-		for x := 0; x < bounds.Max.X; x++ {
-			for y := 0; y < bounds.Max.Y; y++ {
-				c, _ := colorful.MakeColor(img.At(x, y))
-				_, _, l := c.Hsl()
-				sumL += l
-				count++
-			}
-		}
-
-		avgL := sumL / float64(count)
-		curHash := imghash.Average(img)
-		dist := imghash.Distance(prevHash, curHash)
-		fmt.Printf("prev: %d cur: %d  distance: %d avgL:%f\n", prevHash, curHash, dist, avgL)
-
-		sinceLastSave := time.Since(prevSaveTime)
-		mustSaveTime := sinceLastSave > time.Hour
-
-		if (avgL > 0.15 && dist > uint64(*minDistance)) || mustSaveTime {
-			if mustSaveTime {
-				lgr.Info("since_last_save_more_than_1_hour", "since", sinceLastSave)
-			} else {
-				lgr.Info("motion_detected")
-			}
-
-			ts := time.Now()
-
-			sum := sha256.Sum256(imgb)
-			filename := ts.Format("2006-01-02_15:04:05") + "_" + hex.EncodeToString(sum[:]) + ".jpg"
-
-			if *fileDir != "" {
-				err = ioutil.WriteFile(filename, imgb, 0644)
-				if err != nil {
-					lgr.Error("write_file_err", "err", err)
-				}
-			}
-
+		if motionFrames > 1 {
+			lgr.Info("motion-detected", "frames", motionFrames)
 			if *bucket != "" {
+				tsFilename := fmt.Sprintf("ts/%d.ts", segment.ts.Unix())
+
 				_, err = s3client.PutObject(&s3.PutObjectInput{
-					Bucket:      bucket,
-					Key:         &filename,
-					Body:        bytes.NewReader(imgb),
-					ContentType: aws.String("image/jpeg"),
+					Bucket: bucket,
+					Key:    &tsFilename,
+					Body:   bytes.NewReader(segment.data),
 				})
 				if err != nil {
 					lgr.Error("s3_put_obj_err", "err", err)
 					continue
 				}
 
-				req, _ := s3client.GetObjectRequest(&s3.GetObjectInput{
-					Bucket: bucket,
-					Key:    &filename,
-				})
-
-				presignedURL, err := req.Presign(6 * time.Hour)
+				mp4, err := toMP4(ctx, segment)
 				if err != nil {
-					lgr.Error("s3_presign_err", "err", err)
+					lgr.Error("to_mp4_err", "err", err)
+					continue
+				}
+
+				mp4Filename := fmt.Sprintf("mp4/%d.mp4", segment.ts.Unix())
+				_, err = s3client.PutObject(&s3.PutObjectInput{
+					Bucket:      bucket,
+					Key:         &mp4Filename,
+					Body:        bytes.NewReader(mp4),
+					ContentType: aws.String("video/mp4"),
+				})
+				if err != nil {
+					lgr.Error("s3_put_obj_err", "err", err)
+					continue
+				}
+
+				gif, err := toGIF(ctx, segment)
+				if err != nil {
+					lgr.Error("to_gif_err", "err", err)
+					continue
+				}
+
+				gifFilename := fmt.Sprintf("gif/%d.gif", segment.ts.Unix())
+				_, err = s3client.PutObject(&s3.PutObjectInput{
+					Bucket:      bucket,
+					Key:         &gifFilename,
+					Body:        bytes.NewReader(gif),
+					ContentType: aws.String("image/gif"),
+				})
+				if err != nil {
+					lgr.Error("s3_put_obj_err", "err", err)
 					continue
 				}
 
 				if webhookURL != "" {
+					mp4Req, _ := s3client.GetObjectRequest(&s3.GetObjectInput{
+						Bucket: bucket,
+						Key:    &mp4Filename,
+					})
+
+					mp4PresignedURL, err := mp4Req.Presign(6 * time.Hour)
+					if err != nil {
+						lgr.Error("s3_presign_err", "err", err)
+						continue
+					}
+
+					gifReq, _ := s3client.GetObjectRequest(&s3.GetObjectInput{
+						Bucket: bucket,
+						Key:    &gifFilename,
+					})
+
+					gifPresignedURL, err := gifReq.Presign(6 * time.Hour)
+					if err != nil {
+						lgr.Error("s3_presign_err", "err", err)
+						continue
+					}
+
 					err = slack.PostWebhook(webhookURL, &slack.WebhookMessage{
 						Attachments: []slack.Attachment{
 							{
-								Title:     filename,
-								TitleLink: presignedURL,
-								ImageURL:  presignedURL,
+								Title:     segment.ts.In(fixedLoc).Format(time.RFC3339),
+								TitleLink: mp4PresignedURL,
+								ImageURL:  gifPresignedURL,
+								Fields: []slack.AttachmentField{
+									{
+										Title: "Frames",
+										Value: strconv.Itoa(motionFrames),
+										Short: true,
+									},
+								},
 							},
 						},
 					})
@@ -155,15 +167,263 @@ func main() {
 						lgr.Error("slack_webhook_err", "err", err)
 					}
 				}
+			}
+		}
+	}
+}
 
-				prevSaveTime = time.Now()
+type Segment struct {
+	ts   time.Time
+	data []byte
+}
 
+func captureSource(ctx context.Context, lgr log15.Logger, segmentChan chan Segment) error {
+	cmd := cmd(ffmpegPath, "-f", "video4linux2", "-r", "10", "-input_format", "h264", "-video_size", "640x480", "-i", *dev, "-vcodec", "copy", "-acodec", "copy", "-f", "mpegts", "-")
+
+	cmd.Stderr = io.Discard
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+
+	br := bufio.NewReader(stdout)
+
+	pktlen := 188
+
+	go func() {
+		buf := make([]byte, pktlen)
+
+		for {
+			allocedBuf := make([]byte, 0, pktlen*10*10) // 10fps * 10 seconds
+			w := bytes.NewBuffer(allocedBuf)
+			ts := time.Now()
+			stop := ts.Add(segmentSize)
+			count := 0
+			for time.Now().Before(stop) {
+				_, err = io.ReadFull(br, buf)
+				if err != nil {
+					panic(err)
+				}
+				w.Write(buf)
+				count++
 			}
 
-		} else {
-			lgr.Info("No motion detected")
+			segment := Segment{
+				ts:   ts,
+				data: w.Bytes(),
+			}
+
+			select {
+			case <-ctx.Done():
+				close(segmentChan)
+				return
+			case segmentChan <- segment:
+			}
+		}
+	}()
+
+	return cmd.Start()
+}
+
+func hasMotion(ctx context.Context, lgr log15.Logger, segment Segment) (int, error) {
+	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-vcodec", "rawvideo", "-pix_fmt", "gray", "-vf", "edgedetect", "-f", "rawvideo", "-")
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return 0, err
+	}
+
+	err = cmd.Start()
+	if err != nil {
+		return 0, err
+	}
+
+	go func() {
+		_, err = stdin.Write(segment.data)
+		if err != nil {
+			panic(err)
 		}
 
-		prevHash = curHash
+		stdin.Close()
+	}()
+
+	var (
+		width         = 640
+		height        = 480
+		bytesPerPixel = 1
+
+		prev         = make([]uint8, width*height*bytesPerPixel)
+		next         = make([]uint8, width*height*bytesPerPixel)
+		motionFrames = 0
+	)
+
+	for i := 0; ; i++ {
+		_, err = io.ReadFull(stdout, next)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			panic(err)
+		}
+
+		if i == 0 {
+			copy(prev, next)
+			continue
+		}
+
+		sumPrev := 0
+		sumNext := 0
+
+		// changeCount := 0
+		for h := 0; h < height; h++ {
+			for w := 0; w < width; w++ {
+				idx := h*width + w
+
+				sumPrev += int(prev[idx])
+				sumNext += int(next[idx])
+			}
+		}
+
+		diff := sumPrev - sumNext
+		if diff < 0 {
+			diff = sumNext - sumPrev
+		}
+
+		if diff > 20000 {
+			motionFrames++
+		}
+
+		copy(prev, next)
 	}
+
+	err = cmd.Wait()
+	if err != nil {
+		// lgr.Error("has_motion_exit_err", "err", err, "stderr", stderr.String())
+		lgr.Error("has_motion_exit_err", "err", err)
+	}
+
+	return motionFrames, nil
+}
+
+func toMKV(ctx context.Context, segment Segment) ([]byte, error) {
+	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-vcodec", "copy", "-acodec", "copy", "-f", "matroska", "-")
+	cmd.Stderr = io.Discard
+
+	buf := make([]byte, 0, len(segment.data))
+	out := bytes.NewBuffer(buf)
+
+	cmd.Stdout = out
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	err = cmd.Start()
+	if err != nil {
+		return nil, err
+	}
+
+	stdin.Write(segment.data)
+	stdin.Close()
+
+	err = cmd.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	return out.Bytes(), nil
+}
+
+func toMP4(ctx context.Context, segment Segment) ([]byte, error) {
+	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-vcodec", "copy", "-acodec", "copy", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "-")
+	cmd.Stderr = io.Discard
+
+	buf := make([]byte, 0, len(segment.data))
+	out := bytes.NewBuffer(buf)
+
+	cmd.Stdout = out
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	err = cmd.Start()
+	if err != nil {
+		return nil, err
+	}
+
+	stdin.Write(segment.data)
+	stdin.Close()
+
+	err = cmd.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	return out.Bytes(), nil
+}
+
+func toJPG(ctx context.Context, segment Segment) ([]byte, error) {
+	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-vframes", "1", "-f", "mjpeg", "-")
+	cmd.Stderr = io.Discard
+
+	buf := make([]byte, 0, len(segment.data))
+	out := bytes.NewBuffer(buf)
+
+	cmd.Stdout = out
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	err = cmd.Start()
+	if err != nil {
+		return nil, err
+	}
+
+	stdin.Write(segment.data)
+	stdin.Close()
+
+	err = cmd.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	return out.Bytes(), nil
+}
+
+func toGIF(ctx context.Context, segment Segment) ([]byte, error) {
+	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-f", "gif", "-")
+	cmd.Stderr = io.Discard
+
+	buf := make([]byte, 0, len(segment.data))
+	out := bytes.NewBuffer(buf)
+
+	cmd.Stdout = out
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	err = cmd.Start()
+	if err != nil {
+		return nil, err
+	}
+
+	stdin.Write(segment.data)
+	stdin.Close()
+
+	err = cmd.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	return out.Bytes(), nil
+}
+
+func cmd(name string, args ...string) *exec.Cmd {
+	//	fmt.Printf("run: %s %s\n", name, strings.Join(args, " "))
+	return exec.Command(name, args...)
 }
