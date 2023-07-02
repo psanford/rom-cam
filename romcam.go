@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,49 +16,64 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/inconshreveable/log15"
+	"github.com/psanford/rom-cam/config"
 	"github.com/slack-go/slack"
 )
 
-var ffmpegPath = "/home/psanford/projects/rom-cam/ffmpeg"
-var segmentSize = 10 * time.Second // this matches the gop for the logitec cam
+var (
+	segmentSize = 10 * time.Second // this matches the gop for the logitec cam
+	fixedLoc    = time.FixedZone("UTC-7", -7*60*60)
 
-var dev = flag.String("dev", "/dev/video0", "v4l device")
-var saveTSDir = flag.String("save-ts", "", "Directory to save segments to")
-var bucket = flag.String("bucket", "", "S3 bucket")
+	confPath = flag.String("config", "", "Path to config file")
 
-var fixedLoc = time.FixedZone("UTC-7", -7*60*60)
+	ffmpegPath = ""
+	dev        = ""
+)
 
 func main() {
 	flag.Parse()
+
 	handler := log15.StreamHandler(os.Stdout, log15.LogfmtFormat())
 	log15.Root().SetHandler(handler)
 	lgr := log15.New()
 
 	ctx := context.Background()
 
-	webhookURL := os.Getenv("SLACK_WEBHOOK_URL")
+	conf, err := config.LoadConfig(*confPath)
+	if err != nil {
+		log.Fatalf("load config err: %s", err)
+	}
 
-	// set AWS_ACCESS_KEY_ID
-	//     AWS_SECRET_ACCESS_KEY
+	ffmpegPath = conf.FFMPEGPath
+	dev = conf.Device
+
+	fmt.Printf("config: %+v\n", conf)
+
+	var creds *credentials.Credentials
+	if conf.AWSCreds != nil {
+		creds = credentials.NewStaticCredentials(conf.AWSCreds.AccessKeyID, conf.AWSCreds.SecretAccessKey, "")
+	}
 	sess := session.New(&aws.Config{
-		Region: aws.String("us-east-1"),
+		Region:      aws.String("us-east-1"),
+		Credentials: creds,
 	})
 	s3client := s3.New(sess)
 
 	segmentChan := make(chan Segment, 1)
 
-	err := captureSource(ctx, lgr, segmentChan)
+	err = captureSource(ctx, lgr, segmentChan)
 	if err != nil {
 		panic(err)
 	}
 	first := true
 
 	for segment := range segmentChan {
-		if *saveTSDir != "" {
-			fp := filepath.Join(*saveTSDir, fmt.Sprintf("%d.ts", segment.ts.Unix()))
+		if conf.SaveTSDir != "" {
+			fp := filepath.Join(conf.SaveTSDir, fmt.Sprintf("%d.ts", segment.ts.Unix()))
 			ioutil.WriteFile(fp, segment.data, 0600)
 			lgr.Info("wrote_local_file", "path", fp)
 		}
@@ -75,11 +91,11 @@ func main() {
 
 		if motionFrames > 1 {
 			lgr.Info("motion-detected", "frames", motionFrames)
-			if *bucket != "" {
+			if conf.Bucket != "" {
 				tsFilename := fmt.Sprintf("ts/%d.ts", segment.ts.Unix())
 
 				_, err = s3client.PutObject(&s3.PutObjectInput{
-					Bucket: bucket,
+					Bucket: &conf.Bucket,
 					Key:    &tsFilename,
 					Body:   bytes.NewReader(segment.data),
 				})
@@ -96,7 +112,7 @@ func main() {
 
 				mp4Filename := fmt.Sprintf("mp4/%d.mp4", segment.ts.Unix())
 				_, err = s3client.PutObject(&s3.PutObjectInput{
-					Bucket:      bucket,
+					Bucket:      &conf.Bucket,
 					Key:         &mp4Filename,
 					Body:        bytes.NewReader(mp4),
 					ContentType: aws.String("video/mp4"),
@@ -114,7 +130,7 @@ func main() {
 
 				gifFilename := fmt.Sprintf("gif/%d.gif", segment.ts.Unix())
 				_, err = s3client.PutObject(&s3.PutObjectInput{
-					Bucket:      bucket,
+					Bucket:      &conf.Bucket,
 					Key:         &gifFilename,
 					Body:        bytes.NewReader(gif),
 					ContentType: aws.String("image/gif"),
@@ -124,9 +140,9 @@ func main() {
 					continue
 				}
 
-				if webhookURL != "" {
+				if conf.WebhookURL != "" {
 					mp4Req, _ := s3client.GetObjectRequest(&s3.GetObjectInput{
-						Bucket: bucket,
+						Bucket: &conf.Bucket,
 						Key:    &mp4Filename,
 					})
 
@@ -137,7 +153,7 @@ func main() {
 					}
 
 					gifReq, _ := s3client.GetObjectRequest(&s3.GetObjectInput{
-						Bucket: bucket,
+						Bucket: &conf.Bucket,
 						Key:    &gifFilename,
 					})
 
@@ -147,7 +163,7 @@ func main() {
 						continue
 					}
 
-					err = slack.PostWebhook(webhookURL, &slack.WebhookMessage{
+					err = slack.PostWebhook(conf.WebhookURL, &slack.WebhookMessage{
 						Attachments: []slack.Attachment{
 							{
 								Title:     segment.ts.In(fixedLoc).Format(time.RFC3339),
@@ -178,9 +194,10 @@ type Segment struct {
 }
 
 func captureSource(ctx context.Context, lgr log15.Logger, segmentChan chan Segment) error {
-	cmd := cmd(ffmpegPath, "-f", "video4linux2", "-r", "10", "-input_format", "h264", "-video_size", "640x480", "-i", *dev, "-vcodec", "copy", "-acodec", "copy", "-f", "mpegts", "-")
+	cmd := cmd(ffmpegPath, "-f", "video4linux2", "-r", "10", "-input_format", "h264", "-video_size", "640x480", "-i", dev, "-vcodec", "copy", "-acodec", "copy", "-f", "mpegts", "-")
 
-	cmd.Stderr = io.Discard
+	stderr := &bytes.Buffer{}
+	cmd.Stderr = stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -201,8 +218,12 @@ func captureSource(ctx context.Context, lgr log15.Logger, segmentChan chan Segme
 			count := 0
 			for time.Now().Before(stop) {
 				_, err = io.ReadFull(br, buf)
+				if err == io.EOF {
+					log.Printf("read from ffmpeg src eof")
+					return
+				}
 				if err != nil {
-					panic(err)
+					log.Fatalf("read from ffmpeg src err: %s", err)
 				}
 				w.Write(buf)
 				count++
@@ -219,10 +240,24 @@ func captureSource(ctx context.Context, lgr log15.Logger, segmentChan chan Segme
 				return
 			case segmentChan <- segment:
 			}
+			stderr.Reset()
 		}
 	}()
 
-	return cmd.Start()
+	err = cmd.Start()
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		err := cmd.Wait()
+		if err != nil {
+			// lgr.Error("has_motion_exit_err", "err", err, "stderr", stderr.String())
+			lgr.Error("ffmpeg_src_exit_err", "dev", dev, "err", err, "stderr", stderr.String())
+		}
+	}()
+
+	return nil
 }
 
 func hasMotion(ctx context.Context, lgr log15.Logger, segment Segment) (int, error) {
