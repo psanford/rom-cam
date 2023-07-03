@@ -13,6 +13,10 @@ import (
 
 func LoadUVCVideo() error {
 	for _, mod := range []string{
+		"kernel/drivers/media/common/videobuf2/videobuf2-common.ko",
+		"kernel/drivers/media/common/videobuf2/videobuf2-memops.ko",
+		"kernel/drivers/media/common/videobuf2/videobuf2-vmalloc.ko",
+		"kernel/drivers/media/common/videobuf2/videobuf2-v4l2.ko",
 		"kernel/drivers/media/common/uvc.ko",
 		"kernel/drivers/media/usb/uvc/uvcvideo.ko",
 	} {
@@ -25,7 +29,8 @@ func LoadUVCVideo() error {
 }
 
 func loadModule(mod string) error {
-	f, err := os.Open(filepath.Join("/lib/modules", release, mod))
+	path := filepath.Join("/lib/modules", release, mod)
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
@@ -40,7 +45,7 @@ func loadModule(mod string) error {
 		}
 	}
 	modname := strings.TrimSuffix(filepath.Base(mod), ".ko")
-	log.Printf("modprobe %v", modname)
+	log.Printf("modprobe %s %v", path, modname)
 	return nil
 }
 
