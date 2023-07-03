@@ -12,8 +12,8 @@ import (
 )
 
 func LoadUVCVideo() error {
-	// modprobe the hci_uart driver for Raspberry Pi (3B+, others)
 	for _, mod := range []string{
+		"kernel/drivers/media/common/uvc.ko",
 		"kernel/drivers/media/usb/uvc/uvcvideo.ko",
 	} {
 		if err := loadModule(mod); err != nil && !os.IsNotExist(err) {

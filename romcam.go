@@ -260,6 +260,8 @@ func captureSource(ctx context.Context, lgr log15.Logger, segmentChan chan Segme
 		if err != nil {
 			// lgr.Error("has_motion_exit_err", "err", err, "stderr", stderr.String())
 			lgr.Error("ffmpeg_src_exit_err", "dev", dev, "err", err, "stderr", stderr.String())
+			time.Sleep(5 * time.Second)
+			os.Exit(1)
 		}
 	}()
 
