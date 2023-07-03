@@ -1,0 +1,40 @@
+<!doctype html5>
+<html>
+
+  <style>
+   video {
+       width: 640;
+       height: 480;
+       border: 1px solid;
+   }
+  </style>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+
+  <video id="video"></video>
+  <br>
+  <button id="play">Play</button>
+  <script>
+   if (Hls.isSupported()) {
+       var video = document.getElementById('video');
+       var hls = new Hls();
+       hls.on(Hls.Events.MEDIA_ATTACHED, function () {
+           console.log('video and hls.js are now bound together !');
+       });
+       hls.on(Hls.Events.MANIFEST_PARSED, function (event, data) {
+           console.log(
+               'manifest loaded, found ' + data.levels.length + ' quality level'
+           );
+       });
+       hls.loadSource('playlist.m3u8');
+       hls.attachMedia(video);
+
+       var play_btn = document.getElementById('play')
+       play_btn.addEventListener("click", function() {
+           video.play();
+       });
+   }
+
+
+
+  </script>

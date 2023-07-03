@@ -25,6 +25,8 @@ import (
 	"github.com/nareix/joy4/codec/h264parser"
 	"github.com/psanford/rom-cam/config"
 	"github.com/psanford/rom-cam/kernelmodule"
+	"github.com/psanford/rom-cam/segment"
+	"github.com/psanford/rom-cam/webserver"
 	"github.com/slack-go/slack"
 )
 
@@ -36,6 +38,11 @@ var (
 
 	ffmpegPath = ""
 	dev        = ""
+)
+
+const (
+	H264IDRFrame    = 1
+	H264NonIDRFrame = 5
 )
 
 func main() {
@@ -62,9 +69,34 @@ func main() {
 		}
 	}
 
+	s := server{
+		conf: *conf,
+		ring: segment.NewRing(3),
+	}
+
+	if conf.WebserverListenAddr != "" {
+		go func() {
+			lgr.Info("starting_webserver", "addr", conf.WebserverListenAddr)
+			err := webserver.ListenAndServe(lgr, s.ring, ffmpegPath, conf.WebserverListenAddr)
+			if err != nil {
+				lgr.Error("listen and serve err: %s", err)
+			}
+		}()
+	}
+
+	s.run(ctx, lgr)
+
+}
+
+type server struct {
+	conf config.Config
+	ring *segment.Ring
+}
+
+func (s *server) run(ctx context.Context, lgr log15.Logger) {
 	var creds *credentials.Credentials
-	if conf.AWSCreds != nil {
-		creds = credentials.NewStaticCredentials(conf.AWSCreds.AccessKeyID, conf.AWSCreds.SecretAccessKey, "")
+	if s.conf.AWSCreds != nil {
+		creds = credentials.NewStaticCredentials(s.conf.AWSCreds.AccessKeyID, s.conf.AWSCreds.SecretAccessKey, "")
 	}
 	sess := session.New(&aws.Config{
 		Region:      aws.String("us-east-1"),
@@ -72,20 +104,22 @@ func main() {
 	})
 	s3client := s3.New(sess)
 
-	segmentChan := make(chan Segment, 1)
+	segmentChan := make(chan segment.Segment, 1)
 
 	resetChan := make(chan struct{}, 1)
 
-	err = captureSource(ctx, lgr, resetChan, segmentChan)
+	err := captureSource(ctx, lgr, resetChan, segmentChan)
 	if err != nil {
 		panic(err)
 	}
 	first := true
 
 	for segment := range segmentChan {
-		if conf.SaveTSDir != "" {
-			fp := filepath.Join(conf.SaveTSDir, fmt.Sprintf("%d.ts", segment.ts.Unix()))
-			ioutil.WriteFile(fp, segment.data, 0600)
+		s.ring.Push(segment)
+
+		if s.conf.SaveTSDir != "" {
+			fp := filepath.Join(s.conf.SaveTSDir, fmt.Sprintf("%d.ts", segment.TS.Unix()))
+			ioutil.WriteFile(fp, segment.Data, 0600)
 			lgr.Info("wrote_local_file", "path", fp)
 		}
 		if first {
@@ -104,13 +138,13 @@ func main() {
 
 		if motionFrames > 1 {
 			lgr.Info("motion-detected", "frames", motionFrames)
-			if conf.Bucket != "" {
-				tsFilename := fmt.Sprintf("ts/%d.ts", segment.ts.Unix())
+			if s.conf.Bucket != "" {
+				tsFilename := fmt.Sprintf("ts/%d.ts", segment.TS.Unix())
 
 				_, err = s3client.PutObject(&s3.PutObjectInput{
-					Bucket: &conf.Bucket,
+					Bucket: &s.conf.Bucket,
 					Key:    &tsFilename,
-					Body:   bytes.NewReader(segment.data),
+					Body:   bytes.NewReader(segment.Data),
 				})
 				if err != nil {
 					lgr.Error("s3_put_obj_err", "err", err)
@@ -123,9 +157,9 @@ func main() {
 				if err != nil {
 					lgr.Error("to_mp4_err", "err", err)
 				} else {
-					mp4Filename = fmt.Sprintf("mp4/%d.mp4", segment.ts.Unix())
+					mp4Filename = fmt.Sprintf("mp4/%d.mp4", segment.TS.Unix())
 					_, err = s3client.PutObject(&s3.PutObjectInput{
-						Bucket:      &conf.Bucket,
+						Bucket:      &s.conf.Bucket,
 						Key:         &mp4Filename,
 						Body:        bytes.NewReader(mp4),
 						ContentType: aws.String("video/mp4"),
@@ -140,9 +174,9 @@ func main() {
 				if err != nil {
 					lgr.Error("to_gif_err", "err", err)
 				} else {
-					gifFilename = fmt.Sprintf("gif/%d.gif", segment.ts.Unix())
+					gifFilename = fmt.Sprintf("gif/%d.gif", segment.TS.Unix())
 					_, err = s3client.PutObject(&s3.PutObjectInput{
-						Bucket:      &conf.Bucket,
+						Bucket:      &s.conf.Bucket,
 						Key:         &gifFilename,
 						Body:        bytes.NewReader(gif),
 						ContentType: aws.String("image/gif"),
@@ -153,11 +187,11 @@ func main() {
 					}
 				}
 
-				if conf.WebhookURL != "" {
+				if s.conf.WebhookURL != "" {
 					var mp4PresignedURL, gifPresignedURL string
 					if mp4Filename != "" {
 						mp4Req, _ := s3client.GetObjectRequest(&s3.GetObjectInput{
-							Bucket: &conf.Bucket,
+							Bucket: &s.conf.Bucket,
 							Key:    &mp4Filename,
 						})
 
@@ -169,7 +203,7 @@ func main() {
 
 					if gifFilename != "" {
 						gifReq, _ := s3client.GetObjectRequest(&s3.GetObjectInput{
-							Bucket: &conf.Bucket,
+							Bucket: &s.conf.Bucket,
 							Key:    &gifFilename,
 						})
 
@@ -179,10 +213,10 @@ func main() {
 						}
 					}
 
-					err = slack.PostWebhook(conf.WebhookURL, &slack.WebhookMessage{
+					err = slack.PostWebhook(s.conf.WebhookURL, &slack.WebhookMessage{
 						Attachments: []slack.Attachment{
 							{
-								Title:     segment.ts.In(fixedLoc).Format(time.RFC3339),
+								Title:     segment.TS.In(fixedLoc).Format(time.RFC3339),
 								TitleLink: mp4PresignedURL,
 								ImageURL:  gifPresignedURL,
 								Fields: []slack.AttachmentField{
@@ -204,12 +238,7 @@ func main() {
 	}
 }
 
-type Segment struct {
-	ts   time.Time
-	data []byte
-}
-
-func captureSource(ctx context.Context, lgr log15.Logger, resetChan chan struct{}, segmentChan chan Segment) error {
+func captureSource(ctx context.Context, lgr log15.Logger, resetChan chan struct{}, segmentChan chan segment.Segment) error {
 	firstResultChan := make(chan error)
 	go func() {
 		for {
@@ -237,7 +266,7 @@ func captureSource(ctx context.Context, lgr log15.Logger, resetChan chan struct{
 	return firstResultErr
 }
 
-func captureSourceOnce(ctx context.Context, lgr log15.Logger, segmentChan chan Segment) error {
+func captureSourceOnce(ctx context.Context, lgr log15.Logger, segmentChan chan segment.Segment) error {
 	cmd := cmd(ffmpegPath, "-f", "video4linux2", "-r", "10", "-input_format", "h264", "-video_size", "640x480", "-i", dev, "-vcodec", "copy", "-acodec", "copy", "-f", "mpegts", "-")
 
 	stderr := &bytes.Buffer{}
@@ -264,6 +293,7 @@ func captureSourceOnce(ctx context.Context, lgr log15.Logger, segmentChan chan S
 			stop := ts.Add(segmentSize)
 			count := 0
 			shouldBreak := false
+			frameCount := 0
 		OUTER:
 			for {
 				if time.Now().After(stop) {
@@ -300,9 +330,12 @@ func captureSourceOnce(ctx context.Context, lgr log15.Logger, segmentChan chan S
 								continue
 							}
 							typ := nalu[0] & 0x1f
-							if typ == h264parser.NALU_PPS {
+							switch typ {
+							case h264parser.NALU_PPS:
 								hasPendingPPS = true
 								continue OUTER
+							case H264IDRFrame, H264NonIDRFrame:
+								frameCount++
 							}
 						}
 					}
@@ -312,9 +345,10 @@ func captureSourceOnce(ctx context.Context, lgr log15.Logger, segmentChan chan S
 				count++
 			}
 
-			segment := Segment{
-				ts:   ts,
-				data: w.Bytes(),
+			segment := segment.Segment{
+				TS:     ts,
+				Data:   w.Bytes(),
+				Frames: frameCount,
 			}
 
 			select {
@@ -352,7 +386,7 @@ func captureSourceOnce(ctx context.Context, lgr log15.Logger, segmentChan chan S
 	return nil
 }
 
-func hasMotion(ctx context.Context, lgr log15.Logger, segment Segment) (int, error) {
+func hasMotion(ctx context.Context, lgr log15.Logger, segment segment.Segment) (int, error) {
 	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-vcodec", "rawvideo", "-pix_fmt", "gray", "-vf", "edgedetect", "-f", "rawvideo", "-")
 
 	var stderr bytes.Buffer
@@ -369,7 +403,7 @@ func hasMotion(ctx context.Context, lgr log15.Logger, segment Segment) (int, err
 	}
 
 	go func() {
-		_, err = stdin.Write(segment.data)
+		_, err = stdin.Write(segment.Data)
 		if err != nil {
 			panic(err)
 		}
@@ -437,11 +471,11 @@ func hasMotion(ctx context.Context, lgr log15.Logger, segment Segment) (int, err
 
 var hasMotionFFMPEGExitErr = errors.New("ffmpeg exit err")
 
-func toMKV(ctx context.Context, segment Segment) ([]byte, error) {
+func toMKV(ctx context.Context, segment segment.Segment) ([]byte, error) {
 	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-vcodec", "copy", "-acodec", "copy", "-f", "matroska", "-")
 	cmd.Stderr = io.Discard
 
-	buf := make([]byte, 0, len(segment.data))
+	buf := make([]byte, 0, len(segment.Data))
 	out := bytes.NewBuffer(buf)
 
 	cmd.Stdout = out
@@ -455,7 +489,7 @@ func toMKV(ctx context.Context, segment Segment) ([]byte, error) {
 		return nil, err
 	}
 
-	stdin.Write(segment.data)
+	stdin.Write(segment.Data)
 	stdin.Close()
 
 	err = cmd.Wait()
@@ -466,11 +500,11 @@ func toMKV(ctx context.Context, segment Segment) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-func toMP4(ctx context.Context, segment Segment) ([]byte, error) {
+func toMP4(ctx context.Context, segment segment.Segment) ([]byte, error) {
 	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-vcodec", "copy", "-acodec", "copy", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "-")
 	cmd.Stderr = io.Discard
 
-	buf := make([]byte, 0, len(segment.data))
+	buf := make([]byte, 0, len(segment.Data))
 	out := bytes.NewBuffer(buf)
 
 	cmd.Stdout = out
@@ -484,7 +518,7 @@ func toMP4(ctx context.Context, segment Segment) ([]byte, error) {
 		return nil, err
 	}
 
-	stdin.Write(segment.data)
+	stdin.Write(segment.Data)
 	stdin.Close()
 
 	err = cmd.Wait()
@@ -495,11 +529,11 @@ func toMP4(ctx context.Context, segment Segment) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-func toJPG(ctx context.Context, segment Segment) ([]byte, error) {
+func toJPG(ctx context.Context, segment segment.Segment) ([]byte, error) {
 	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-vframes", "1", "-f", "mjpeg", "-")
 	cmd.Stderr = io.Discard
 
-	buf := make([]byte, 0, len(segment.data))
+	buf := make([]byte, 0, len(segment.Data))
 	out := bytes.NewBuffer(buf)
 
 	cmd.Stdout = out
@@ -513,7 +547,7 @@ func toJPG(ctx context.Context, segment Segment) ([]byte, error) {
 		return nil, err
 	}
 
-	stdin.Write(segment.data)
+	stdin.Write(segment.Data)
 	stdin.Close()
 
 	err = cmd.Wait()
@@ -524,11 +558,11 @@ func toJPG(ctx context.Context, segment Segment) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-func toGIF(ctx context.Context, segment Segment) ([]byte, error) {
+func toGIF(ctx context.Context, segment segment.Segment) ([]byte, error) {
 	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-f", "gif", "-")
 	cmd.Stderr = io.Discard
 
-	buf := make([]byte, 0, len(segment.data))
+	buf := make([]byte, 0, len(segment.Data))
 	out := bytes.NewBuffer(buf)
 
 	cmd.Stdout = out
@@ -542,7 +576,7 @@ func toGIF(ctx context.Context, segment Segment) ([]byte, error) {
 		return nil, err
 	}
 
-	stdin.Write(segment.data)
+	stdin.Write(segment.Data)
 	stdin.Close()
 
 	err = cmd.Wait()
