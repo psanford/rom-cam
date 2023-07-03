@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,11 +16,13 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Comcast/gots/packet"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/inconshreveable/log15"
+	"github.com/nareix/joy4/codec/h264parser"
 	"github.com/psanford/rom-cam/config"
 	"github.com/psanford/rom-cam/kernelmodule"
 	"github.com/slack-go/slack"
@@ -71,7 +74,9 @@ func main() {
 
 	segmentChan := make(chan Segment, 1)
 
-	err = captureSource(ctx, lgr, segmentChan)
+	resetChan := make(chan struct{}, 1)
+
+	err = captureSource(ctx, lgr, resetChan, segmentChan)
 	if err != nil {
 		panic(err)
 	}
@@ -92,7 +97,9 @@ func main() {
 
 		motionFrames, err := hasMotion(ctx, lgr, segment)
 		if err != nil {
-			panic(err)
+			lgr.Error("has_motion_err_trigger_reset", "err", err)
+			resetChan <- struct{}{}
+			continue
 		}
 
 		if motionFrames > 1 {
@@ -110,63 +117,66 @@ func main() {
 					continue
 				}
 
+				var mp4Filename, gifFilename string
+
 				mp4, err := toMP4(ctx, segment)
 				if err != nil {
 					lgr.Error("to_mp4_err", "err", err)
-					continue
-				}
-
-				mp4Filename := fmt.Sprintf("mp4/%d.mp4", segment.ts.Unix())
-				_, err = s3client.PutObject(&s3.PutObjectInput{
-					Bucket:      &conf.Bucket,
-					Key:         &mp4Filename,
-					Body:        bytes.NewReader(mp4),
-					ContentType: aws.String("video/mp4"),
-				})
-				if err != nil {
-					lgr.Error("s3_put_obj_err", "err", err)
-					continue
+				} else {
+					mp4Filename = fmt.Sprintf("mp4/%d.mp4", segment.ts.Unix())
+					_, err = s3client.PutObject(&s3.PutObjectInput{
+						Bucket:      &conf.Bucket,
+						Key:         &mp4Filename,
+						Body:        bytes.NewReader(mp4),
+						ContentType: aws.String("video/mp4"),
+					})
+					if err != nil {
+						lgr.Error("s3_put_obj_err", "err", err)
+						continue
+					}
 				}
 
 				gif, err := toGIF(ctx, segment)
 				if err != nil {
 					lgr.Error("to_gif_err", "err", err)
-					continue
-				}
-
-				gifFilename := fmt.Sprintf("gif/%d.gif", segment.ts.Unix())
-				_, err = s3client.PutObject(&s3.PutObjectInput{
-					Bucket:      &conf.Bucket,
-					Key:         &gifFilename,
-					Body:        bytes.NewReader(gif),
-					ContentType: aws.String("image/gif"),
-				})
-				if err != nil {
-					lgr.Error("s3_put_obj_err", "err", err)
-					continue
+				} else {
+					gifFilename = fmt.Sprintf("gif/%d.gif", segment.ts.Unix())
+					_, err = s3client.PutObject(&s3.PutObjectInput{
+						Bucket:      &conf.Bucket,
+						Key:         &gifFilename,
+						Body:        bytes.NewReader(gif),
+						ContentType: aws.String("image/gif"),
+					})
+					if err != nil {
+						lgr.Error("s3_put_obj_err", "err", err)
+						continue
+					}
 				}
 
 				if conf.WebhookURL != "" {
-					mp4Req, _ := s3client.GetObjectRequest(&s3.GetObjectInput{
-						Bucket: &conf.Bucket,
-						Key:    &mp4Filename,
-					})
+					var mp4PresignedURL, gifPresignedURL string
+					if mp4Filename != "" {
+						mp4Req, _ := s3client.GetObjectRequest(&s3.GetObjectInput{
+							Bucket: &conf.Bucket,
+							Key:    &mp4Filename,
+						})
 
-					mp4PresignedURL, err := mp4Req.Presign(6 * time.Hour)
-					if err != nil {
-						lgr.Error("s3_presign_err", "err", err)
-						continue
+						mp4PresignedURL, err = mp4Req.Presign(6 * time.Hour)
+						if err != nil {
+							lgr.Error("s3_presign_err", "err", err)
+						}
 					}
 
-					gifReq, _ := s3client.GetObjectRequest(&s3.GetObjectInput{
-						Bucket: &conf.Bucket,
-						Key:    &gifFilename,
-					})
+					if gifFilename != "" {
+						gifReq, _ := s3client.GetObjectRequest(&s3.GetObjectInput{
+							Bucket: &conf.Bucket,
+							Key:    &gifFilename,
+						})
 
-					gifPresignedURL, err := gifReq.Presign(6 * time.Hour)
-					if err != nil {
-						lgr.Error("s3_presign_err", "err", err)
-						continue
+						gifPresignedURL, err = gifReq.Presign(6 * time.Hour)
+						if err != nil {
+							lgr.Error("s3_presign_err", "err", err)
+						}
 					}
 
 					err = slack.PostWebhook(conf.WebhookURL, &slack.WebhookMessage{
@@ -199,7 +209,35 @@ type Segment struct {
 	data []byte
 }
 
-func captureSource(ctx context.Context, lgr log15.Logger, segmentChan chan Segment) error {
+func captureSource(ctx context.Context, lgr log15.Logger, resetChan chan struct{}, segmentChan chan Segment) error {
+	firstResultChan := make(chan error)
+	go func() {
+		for {
+			childCtx, cancel := context.WithCancel(ctx)
+			err := captureSourceOnce(childCtx, lgr, segmentChan)
+			select {
+			case firstResultChan <- err:
+			default:
+			}
+
+			select {
+			case <-resetChan:
+				lgr.Info("resetting_src_stream")
+				cancel()
+			case <-ctx.Done():
+				cancel()
+				return
+			}
+		}
+	}()
+
+	firstResultErr := <-firstResultChan
+	firstResultChan = nil
+
+	return firstResultErr
+}
+
+func captureSourceOnce(ctx context.Context, lgr log15.Logger, segmentChan chan Segment) error {
 	cmd := cmd(ffmpegPath, "-f", "video4linux2", "-r", "10", "-input_format", "h264", "-video_size", "640x480", "-i", dev, "-vcodec", "copy", "-acodec", "copy", "-f", "mpegts", "-")
 
 	stderr := &bytes.Buffer{}
@@ -214,7 +252,10 @@ func captureSource(ctx context.Context, lgr log15.Logger, segmentChan chan Segme
 	pktlen := 188
 
 	go func() {
-		buf := make([]byte, pktlen)
+		var (
+			pkt           packet.Packet
+			hasPendingPPS bool
+		)
 
 		for {
 			allocedBuf := make([]byte, 0, pktlen*10*10) // 10fps * 10 seconds
@@ -222,8 +263,23 @@ func captureSource(ctx context.Context, lgr log15.Logger, segmentChan chan Segme
 			ts := time.Now()
 			stop := ts.Add(segmentSize)
 			count := 0
-			for time.Now().Before(stop) {
-				_, err = io.ReadFull(br, buf)
+			shouldBreak := false
+		OUTER:
+			for {
+				if time.Now().After(stop) {
+					shouldBreak = true
+				}
+
+				if hasPendingPPS {
+					if shouldBreak {
+						break
+					} else {
+						hasPendingPPS = false
+						w.Write(pkt[:])
+					}
+				}
+
+				_, err = io.ReadFull(br, pkt[:])
 				if err == io.EOF {
 					log.Printf("read from ffmpeg src eof")
 					return
@@ -231,7 +287,28 @@ func captureSource(ctx context.Context, lgr log15.Logger, segmentChan chan Segme
 				if err != nil {
 					log.Fatalf("read from ffmpeg src err: %s", err)
 				}
-				w.Write(buf)
+
+				if pkt.HasPayload() {
+					b, err := pkt.Payload()
+					if err != nil {
+						panic(err)
+					}
+					nalus, streamType := h264parser.SplitNALUs(b)
+					if streamType == h264parser.NALU_ANNEXB {
+						for _, nalu := range nalus {
+							if len(nalu) < 1 {
+								continue
+							}
+							typ := nalu[0] & 0x1f
+							if typ == h264parser.NALU_PPS {
+								hasPendingPPS = true
+								continue OUTER
+							}
+						}
+					}
+				}
+
+				w.Write(pkt[:])
 				count++
 			}
 
@@ -242,7 +319,6 @@ func captureSource(ctx context.Context, lgr log15.Logger, segmentChan chan Segme
 
 			select {
 			case <-ctx.Done():
-				close(segmentChan)
 				return
 			case segmentChan <- segment:
 			}
@@ -255,13 +331,21 @@ func captureSource(ctx context.Context, lgr log15.Logger, segmentChan chan Segme
 		return err
 	}
 
+	shouldDie := true
+	go func() {
+		<-ctx.Done()
+		shouldDie = false
+		cmd.Process.Kill()
+	}()
+
 	go func() {
 		err := cmd.Wait()
-		if err != nil {
-			// lgr.Error("has_motion_exit_err", "err", err, "stderr", stderr.String())
+		if err != nil && shouldDie {
 			lgr.Error("ffmpeg_src_exit_err", "dev", dev, "err", err, "stderr", stderr.String())
 			time.Sleep(5 * time.Second)
 			os.Exit(1)
+		} else {
+			lgr.Info("ffmpeg_src_exit_expected", "dev", dev, "err", err)
 		}
 	}()
 
@@ -345,10 +429,13 @@ func hasMotion(ctx context.Context, lgr log15.Logger, segment Segment) (int, err
 	if err != nil {
 		// lgr.Error("has_motion_exit_err", "err", err, "stderr", stderr.String())
 		lgr.Error("has_motion_exit_err", "err", err)
+		return motionFrames, hasMotionFFMPEGExitErr
 	}
 
 	return motionFrames, nil
 }
+
+var hasMotionFFMPEGExitErr = errors.New("ffmpeg exit err")
 
 func toMKV(ctx context.Context, segment Segment) ([]byte, error) {
 	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-vcodec", "copy", "-acodec", "copy", "-f", "matroska", "-")
