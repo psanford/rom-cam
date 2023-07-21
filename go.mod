@@ -12,7 +12,6 @@ require (
 	github.com/inconshreveable/log15 v0.0.0-20201112154412-8562bdadbbac
 	github.com/mattn/go-colorable v0.1.8 // indirect
 	github.com/nareix/joy4 v0.0.0-20200507095837-05a4ffbb5369
-	github.com/psanford/gonut v0.0.0-20170623151549-80c91efdd61f
 	github.com/slack-go/slack v0.9.1
 	github.com/spf13/cobra v1.7.0
 	golang.org/x/sys v0.0.0-20200930185726-fdedc70b468f
