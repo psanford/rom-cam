@@ -58,6 +58,10 @@ func (s *Server) playlistHandler(rw http.ResponseWriter, r *http.Request) {
 		p.Append(fmt.Sprintf("/segment/%d", ts), duration, "")
 	}
 
+	if len(segments) > 0 {
+		p.SeqNo = uint64(segments[len(segments)-1].Idx)
+	}
+
 	b := p.Encode()
 	rw.Write(b.Bytes())
 }

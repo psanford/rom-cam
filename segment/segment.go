@@ -7,6 +7,7 @@ import (
 
 type Segment struct {
 	TS     time.Time
+	Idx    int
 	Data   []byte
 	Frames int
 }

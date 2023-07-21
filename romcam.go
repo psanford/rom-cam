@@ -284,6 +284,7 @@ func captureSourceOnce(ctx context.Context, lgr log15.Logger, segmentChan chan s
 		var (
 			pkt           packet.Packet
 			hasPendingPPS bool
+			segmentIdx    int
 		)
 
 		for {
@@ -347,9 +348,11 @@ func captureSourceOnce(ctx context.Context, lgr log15.Logger, segmentChan chan s
 
 			segment := segment.Segment{
 				TS:     ts,
+				Idx:    segmentIdx,
 				Data:   w.Bytes(),
 				Frames: frameCount,
 			}
+			segmentIdx++
 
 			select {
 			case <-ctx.Done():
