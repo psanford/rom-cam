@@ -13,15 +13,25 @@ import (
 
 func LoadUVCVideo() error {
 	for _, mod := range []string{
+		// usb camera
 		"kernel/drivers/media/common/videobuf2/videobuf2-common.ko",
 		"kernel/drivers/media/common/videobuf2/videobuf2-memops.ko",
 		"kernel/drivers/media/common/videobuf2/videobuf2-vmalloc.ko",
 		"kernel/drivers/media/common/videobuf2/videobuf2-v4l2.ko",
 		"kernel/drivers/media/common/uvc.ko",
 		"kernel/drivers/media/usb/uvc/uvcvideo.ko",
+
+		// rpi camera
+		"kernel/drivers/media/mc/mc.ko",
+		"kernel/drivers/staging/vc04_services/vchiq.ko",
+		"kernel/drivers/staging/vc04_services/vc-sm-cma/vc-sm-cma.ko",
+		"kernel/drivers/staging/vc04_services/vchiq-mmal/bcm2835-mmal-vchiq.ko",
+		"kernel/drivers/staging/vc04_services/bcm2835-camera/bcm2835-v4l2.ko",
 	} {
 		if err := loadModule(mod); err != nil && !os.IsNotExist(err) {
 			return err
+		} else if os.IsNotExist(err) {
+			log.Printf("module not found %s", mod)
 		}
 	}
 
