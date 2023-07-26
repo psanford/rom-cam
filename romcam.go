@@ -8,12 +8,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/Comcast/gots/packet"
@@ -23,6 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/inconshreveable/log15"
 	"github.com/nareix/joy4/codec/h264parser"
+	"github.com/paulstuart/ping"
 	"github.com/psanford/rom-cam/config"
 	"github.com/psanford/rom-cam/kernelmodule"
 	"github.com/psanford/rom-cam/segment"
@@ -84,13 +85,15 @@ func main() {
 		}()
 	}
 
-	s.run(ctx, lgr)
+	go s.watchForHomeDevices()
 
+	s.run(ctx, lgr)
 }
 
 type server struct {
-	conf config.Config
-	ring *segment.Ring
+	conf          config.Config
+	ring          *segment.Ring
+	someoneIsHome int32
 }
 
 func (s *server) run(ctx context.Context, lgr log15.Logger) {
@@ -112,21 +115,14 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 	if err != nil {
 		panic(err)
 	}
-	first := true
 
 	for segment := range segmentChan {
 		s.ring.Push(segment)
 
 		if s.conf.SaveTSDir != "" {
 			fp := filepath.Join(s.conf.SaveTSDir, fmt.Sprintf("%d.ts", segment.TS.Unix()))
-			ioutil.WriteFile(fp, segment.Data, 0600)
+			os.WriteFile(fp, segment.Data, 0600)
 			lgr.Info("wrote_local_file", "path", fp)
-		}
-		if first {
-			// skip first 10 seconds of recording,
-			// the camera adjusts when it first starts
-			first = false
-			continue
 		}
 
 		motionFrames, err := hasMotion(ctx, lgr, segment)
@@ -137,7 +133,13 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 		}
 
 		if motionFrames > 1 {
-			lgr.Info("motion-detected", "frames", motionFrames)
+			isHome := atomic.LoadInt32(&s.someoneIsHome) > 0
+			lgr.Info("motion-detected", "frames", motionFrames, "is_home_dont_save", isHome)
+
+			if isHome {
+				continue
+			}
+
 			if s.conf.Bucket != "" {
 				tsFilename := fmt.Sprintf("ts/%d.ts", segment.TS.Unix())
 
@@ -235,6 +237,25 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 				}
 			}
 		}
+	}
+}
+
+func (s *server) watchForHomeDevices() {
+	if len(s.conf.DisableRecordingForIPs) < 1 {
+		return
+	}
+	for {
+		var home int32
+		for _, checkIP := range s.conf.DisableRecordingForIPs {
+			err := ping.Pinger(checkIP, 1)
+			if err == nil {
+				home = 1
+				break
+			}
+		}
+
+		atomic.StoreInt32(&s.someoneIsHome, home)
+		time.Sleep(60 * time.Second)
 	}
 }
 
