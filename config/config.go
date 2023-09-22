@@ -1,8 +1,13 @@
 package config
 
-import "github.com/BurntSushi/toml"
+import (
+	"strings"
+
+	"github.com/BurntSushi/toml"
+)
 
 type Config struct {
+	Name                   string   `toml:"name"`
 	FFMPEGPath             string   `toml:"ffmpeg_path"`
 	Device                 string   `toml:"device"`
 	SaveTSDir              string   `toml:"save_ts_dir"`
@@ -12,6 +17,11 @@ type Config struct {
 	AWSCreds               *AWSCred `toml:"aws_creds"`
 	WebserverListenAddr    string   `toml:"webserver_listen_address"`
 	DisableRecordingForIPs []string `toml:"disable_recording_for_ips"`
+}
+
+func (c *Config) NameForFile() string {
+	name := strings.ToLower(c.Name)
+	return strings.NewReplacer(" ", "_", "/", "_").Replace(name)
 }
 
 type AWSCred struct {

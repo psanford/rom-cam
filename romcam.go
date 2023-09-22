@@ -101,17 +101,22 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 	if s.conf.AWSCreds != nil {
 		creds = credentials.NewStaticCredentials(s.conf.AWSCreds.AccessKeyID, s.conf.AWSCreds.SecretAccessKey, "")
 	}
-	sess := session.New(&aws.Config{
+	sess, err := session.NewSession(&aws.Config{
 		Region:      aws.String("us-east-1"),
 		Credentials: creds,
 	})
+	if err != nil {
+		panic(err)
+	}
 	s3client := s3.New(sess)
 
 	segmentChan := make(chan segment.Segment, 1)
 
 	resetChan := make(chan struct{}, 1)
 
-	err := captureSource(ctx, lgr, resetChan, segmentChan)
+	safeCameraName := s.conf.NameForFile()
+
+	err = captureSource(ctx, lgr, resetChan, segmentChan)
 	if err != nil {
 		panic(err)
 	}
@@ -132,16 +137,23 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 			continue
 		}
 
-		if motionFrames > 1 {
+		if len(motionFrames) > 1 {
 			isHome := atomic.LoadInt32(&s.someoneIsHome) > 0
-			lgr.Info("motion-detected", "frames", motionFrames, "is_home_dont_save", isHome)
+			lgr.Info("motion-detected", "frames", len(motionFrames), "is_home_dont_save", isHome)
 
 			if isHome {
 				continue
 			}
 
+			bestFrame := motionFrames[0]
+			for _, f := range motionFrames[1:] {
+				if f.Diff > bestFrame.Diff {
+					bestFrame = f
+				}
+			}
+
 			if s.conf.Bucket != "" {
-				tsFilename := fmt.Sprintf("ts/%d.ts", segment.TS.Unix())
+				tsFilename := fmt.Sprintf("ts/%s/%d.ts", safeCameraName, segment.TS.Unix())
 
 				_, err = s3client.PutObject(&s3.PutObjectInput{
 					Bucket: &s.conf.Bucket,
@@ -159,7 +171,7 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 				if err != nil {
 					lgr.Error("to_mp4_err", "err", err)
 				} else {
-					mp4Filename = fmt.Sprintf("mp4/%d.mp4", segment.TS.Unix())
+					mp4Filename = fmt.Sprintf("mp4/%s/%d.mp4", safeCameraName, segment.TS.Unix())
 					_, err = s3client.PutObject(&s3.PutObjectInput{
 						Bucket:      &s.conf.Bucket,
 						Key:         &mp4Filename,
@@ -176,7 +188,7 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 				if err != nil {
 					lgr.Error("to_gif_err", "err", err)
 				} else {
-					gifFilename = fmt.Sprintf("gif/%d.gif", segment.TS.Unix())
+					gifFilename = fmt.Sprintf("gif/%s/%d.gif", safeCameraName, segment.TS.Unix())
 					_, err = s3client.PutObject(&s3.PutObjectInput{
 						Bucket:      &s.conf.Bucket,
 						Key:         &gifFilename,
@@ -218,13 +230,13 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 					err = slack.PostWebhook(s.conf.WebhookURL, &slack.WebhookMessage{
 						Attachments: []slack.Attachment{
 							{
-								Title:     segment.TS.In(fixedLoc).Format(time.RFC3339),
+								Title:     fmt.Sprintf("%s %s", s.conf.Name, segment.TS.In(fixedLoc).Format(time.RFC3339)),
 								TitleLink: mp4PresignedURL,
 								ImageURL:  gifPresignedURL,
 								Fields: []slack.AttachmentField{
 									{
 										Title: "Frames",
-										Value: strconv.Itoa(motionFrames),
+										Value: strconv.Itoa(len(motionFrames)),
 										Short: true,
 									},
 								},
@@ -410,7 +422,7 @@ func captureSourceOnce(ctx context.Context, lgr log15.Logger, segmentChan chan s
 	return nil
 }
 
-func hasMotion(ctx context.Context, lgr log15.Logger, segment segment.Segment) (int, error) {
+func hasMotion(ctx context.Context, lgr log15.Logger, segment segment.Segment) ([]motionFrame, error) {
 	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-vcodec", "rawvideo", "-pix_fmt", "gray", "-vf", "edgedetect", "-f", "rawvideo", "-")
 
 	var stderr bytes.Buffer
@@ -418,12 +430,12 @@ func hasMotion(ctx context.Context, lgr log15.Logger, segment segment.Segment) (
 	stdout, err := cmd.StdoutPipe()
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	err = cmd.Start()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	go func() {
@@ -442,7 +454,7 @@ func hasMotion(ctx context.Context, lgr log15.Logger, segment segment.Segment) (
 
 		prev         = make([]uint8, width*height*bytesPerPixel)
 		next         = make([]uint8, width*height*bytesPerPixel)
-		motionFrames = 0
+		motionFrames = []motionFrame{}
 	)
 
 	for i := 0; ; i++ {
@@ -477,7 +489,10 @@ func hasMotion(ctx context.Context, lgr log15.Logger, segment segment.Segment) (
 		}
 
 		if diff > 20000 {
-			motionFrames++
+			motionFrames = append(motionFrames, motionFrame{
+				Idx:  i,
+				Diff: diff,
+			})
 		}
 
 		copy(prev, next)
@@ -491,6 +506,11 @@ func hasMotion(ctx context.Context, lgr log15.Logger, segment segment.Segment) (
 	}
 
 	return motionFrames, nil
+}
+
+type motionFrame struct {
+	Idx  int
+	Diff int
 }
 
 var hasMotionFFMPEGExitErr = errors.New("ffmpeg exit err")
@@ -583,6 +603,35 @@ func toJPG(ctx context.Context, segment segment.Segment) ([]byte, error) {
 }
 
 func toGIF(ctx context.Context, segment segment.Segment) ([]byte, error) {
+	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-f", "gif", "-")
+	cmd.Stderr = io.Discard
+
+	buf := make([]byte, 0, len(segment.Data))
+	out := bytes.NewBuffer(buf)
+
+	cmd.Stdout = out
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	err = cmd.Start()
+	if err != nil {
+		return nil, err
+	}
+
+	stdin.Write(segment.Data)
+	stdin.Close()
+
+	err = cmd.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	return out.Bytes(), nil
+}
+
+func toStillJPG(ctx context.Context, segment segment.Segment, frame int) ([]byte, error) {
 	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-f", "gif", "-")
 	cmd.Stderr = io.Discard
 
