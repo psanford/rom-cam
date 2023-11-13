@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"sync/atomic"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/Comcast/gots/packet"
 	"github.com/aws/aws-sdk-go/aws"
@@ -33,12 +34,13 @@ import (
 
 var (
 	segmentSize = 10 * time.Second // this matches the gop for the logitec cam
-	fixedLoc    = time.FixedZone("UTC-7", -7*60*60)
 
 	confPath = flag.String("config", "", "Path to config file")
 
 	ffmpegPath = ""
 	dev        = ""
+
+	loc *time.Location
 )
 
 const (
@@ -58,6 +60,11 @@ func main() {
 	conf, err := config.LoadConfig(*confPath)
 	if err != nil {
 		log.Fatalf("load config err: %s", err)
+	}
+
+	loc, err = time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		log.Fatalf("load tz location err: %s", err)
 	}
 
 	ffmpegPath = conf.FFMPEGPath
@@ -230,7 +237,7 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 					err = slack.PostWebhook(s.conf.WebhookURL, &slack.WebhookMessage{
 						Attachments: []slack.Attachment{
 							{
-								Title:     fmt.Sprintf("%s %s", s.conf.Name, segment.TS.In(fixedLoc).Format(time.RFC3339)),
+								Title:     fmt.Sprintf("%s %s", s.conf.Name, segment.TS.In(loc).Format(time.RFC3339)),
 								TitleLink: mp4PresignedURL,
 								ImageURL:  gifPresignedURL,
 								Fields: []slack.AttachmentField{
