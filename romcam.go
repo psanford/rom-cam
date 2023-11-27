@@ -266,7 +266,7 @@ func (s *server) watchForHomeDevices() {
 	for {
 		var home int32
 		for _, checkIP := range s.conf.DisableRecordingForIPs {
-			err := ping.Pinger(checkIP, 1)
+			err := ping.Pinger(checkIP, 2)
 			if err == nil {
 				home = 1
 				break
