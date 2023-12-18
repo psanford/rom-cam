@@ -610,7 +610,7 @@ func toJPG(ctx context.Context, segment segment.Segment) ([]byte, error) {
 }
 
 func toGIF(ctx context.Context, segment segment.Segment) ([]byte, error) {
-	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-f", "gif", "-")
+	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-filter_complex", "fps=5,scale=320:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=32[p];[s1][p]paletteuse=dither=bayer", "-f", "gif", "-")
 	cmd.Stderr = io.Discard
 
 	buf := make([]byte, 0, len(segment.Data))
