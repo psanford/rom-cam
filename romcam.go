@@ -191,6 +191,10 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 					}
 				}
 
+				// to tiled image:
+				// this assumes a 120 frame (10fps *12) segment
+				// ffmpeg -i 1719016877.ts -vf "select='lt(n,120)',scale=320:-1,tile=10x12" -frames:v 1 -y b.jpg
+
 				gif, err := toGIF(ctx, segment)
 				if err != nil {
 					lgr.Error("to_gif_err", "err", err)
