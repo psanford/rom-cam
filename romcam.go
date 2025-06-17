@@ -172,7 +172,7 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 					continue
 				}
 
-				var mp4Filename, gifFilename string
+				var mp4Filename, tiledFilename string
 
 				mp4, err := toMP4(ctx, segment)
 				if err != nil {
@@ -191,20 +191,16 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 					}
 				}
 
-				// to tiled image:
-				// this assumes a 120 frame (10fps *12) segment
-				// ffmpeg -i 1719016877.ts -vf "select='lt(n,120)',scale=320:-1,tile=10x12" -frames:v 1 -y b.jpg
-
-				gif, err := toGIF(ctx, segment)
+				tiled, err := toTiled(ctx, segment)
 				if err != nil {
-					lgr.Error("to_gif_err", "err", err)
+					lgr.Error("to_tiled_err", "err", err)
 				} else {
-					gifFilename = fmt.Sprintf("gif/%s/%d.gif", safeCameraName, segment.TS.Unix())
+					tiledFilename = fmt.Sprintf("tiled/%s/%d.jpg", safeCameraName, segment.TS.Unix())
 					_, err = s3client.PutObject(&s3.PutObjectInput{
 						Bucket:      &s.conf.Bucket,
-						Key:         &gifFilename,
-						Body:        bytes.NewReader(gif),
-						ContentType: aws.String("image/gif"),
+						Key:         &tiledFilename,
+						Body:        bytes.NewReader(tiled),
+						ContentType: aws.String("image/jpeg"),
 					})
 					if err != nil {
 						lgr.Error("s3_put_obj_err", "err", err)
@@ -213,7 +209,7 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 				}
 
 				if s.conf.WebhookURL != "" {
-					var mp4PresignedURL, gifPresignedURL string
+					var mp4PresignedURL, tiledPresignedURL string
 					if mp4Filename != "" {
 						mp4Req, _ := s3client.GetObjectRequest(&s3.GetObjectInput{
 							Bucket: &s.conf.Bucket,
@@ -226,13 +222,13 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 						}
 					}
 
-					if gifFilename != "" {
-						gifReq, _ := s3client.GetObjectRequest(&s3.GetObjectInput{
+					if tiledFilename != "" {
+						tiledReq, _ := s3client.GetObjectRequest(&s3.GetObjectInput{
 							Bucket: &s.conf.Bucket,
-							Key:    &gifFilename,
+							Key:    &tiledFilename,
 						})
 
-						gifPresignedURL, err = gifReq.Presign(6 * time.Hour)
+						tiledPresignedURL, err = tiledReq.Presign(6 * time.Hour)
 						if err != nil {
 							lgr.Error("s3_presign_err", "err", err)
 						}
@@ -243,7 +239,7 @@ func (s *server) run(ctx context.Context, lgr log15.Logger) {
 							{
 								Title:     fmt.Sprintf("%s %s", s.conf.Name, segment.TS.In(loc).Format(time.RFC3339)),
 								TitleLink: mp4PresignedURL,
-								ImageURL:  gifPresignedURL,
+								ImageURL:  tiledPresignedURL,
 								Fields: []slack.AttachmentField{
 									{
 										Title: "Frames",
@@ -644,6 +640,37 @@ func toGIF(ctx context.Context, segment segment.Segment) ([]byte, error) {
 
 func toStillJPG(ctx context.Context, segment segment.Segment, frame int) ([]byte, error) {
 	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-f", "gif", "-")
+	cmd.Stderr = io.Discard
+
+	buf := make([]byte, 0, len(segment.Data))
+	out := bytes.NewBuffer(buf)
+
+	cmd.Stdout = out
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	err = cmd.Start()
+	if err != nil {
+		return nil, err
+	}
+
+	stdin.Write(segment.Data)
+	stdin.Close()
+
+	err = cmd.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	return out.Bytes(), nil
+}
+
+func toTiled(ctx context.Context, segment segment.Segment) ([]byte, error) {
+	// This assumes a 120 frame (10fps * 12) segment
+	// Command creates a tiled image from frames in the segment (10x12 grid)
+	cmd := cmd(ffmpegPath, "-f", "mpegts", "-i", "-", "-vf", "select='lt(n,120)',scale=320:-1,tile=10x12", "-frames:v", "1", "-f", "mjpeg", "-")
 	cmd.Stderr = io.Discard
 
 	buf := make([]byte, 0, len(segment.Data))
